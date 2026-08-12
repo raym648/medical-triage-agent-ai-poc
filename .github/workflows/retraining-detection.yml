@@ -140,39 +140,86 @@ jobs:
           import json
           import requests
 
-          base_url = os.environ["HF_API_SPACE_URL_INJECT"]
+          base_url = os.environ["HF_API_SPACE_URL_INJECT"].rstrip("/")
           token = os.environ["AUDIT_TOKEN"]
-          headers = {"Authorization": f"Bearer {token}"}
 
-          # GET /audit/clinical — désaccords / requires_human_review
-          # (limit=1000 : plafond max accepté par l'endpoint, cf. audit.py)
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/json",
+          }
+
+          def fail_request(method, path, response):
+              body = response.text[:500].replace("\n", " ")
+              raise RuntimeError(
+                  f"{method} {path} failed: "
+                  f"HTTP {response.status_code} — {body}"
+              )
+
+          # ------------------------------------------------------
+          # GET /audit/clinical
+          # ------------------------------------------------------
           clinical = requests.get(
               f"{base_url}/audit/clinical",
               headers=headers,
               params={"limit": 1000},
-              timeout=30,
+              timeout=(10, 30),
           )
-          clinical.raise_for_status()
+
+          if not clinical.ok:
+              fail_request("GET", "/audit/clinical", clinical)
+
           clinical_data = clinical.json()
 
           logs = clinical_data.get("logs", [])
+
           total_analyzed = len(logs)
+
           requires_review_count = sum(
-              1 for entry in logs if entry.get("requires_human_review") is True
+              1
+              for entry in logs
+              if entry.get("requires_human_review") is True
           )
 
-          # GET /monitoring/requests — taux d'erreur global (pas de scope requis)
+          # ------------------------------------------------------
+          # GET /monitoring/requests
+          #
+          # IMPORTANT:
+          # Le workflow transmet maintenant le JWT.
+          # L'ancien commentaire "pas de scope requis" a été
+          # supprimé car le serveur renvoie actuellement 401
+          # lorsque la requête est envoyée sans Authorization.
+          # ------------------------------------------------------
           requests_metrics = requests.get(
               f"{base_url}/monitoring/requests",
-              timeout=30,
-          )
-          requests_metrics.raise_for_status()
-          error_rate_percent = (
-              requests_metrics.json().get("metrics", {}).get("error_rate_percent", 0.0)
+              headers=headers,
+              timeout=(10, 30),
           )
 
-          min_disagreements = int(os.environ["MIN_DISAGREEMENTS"])
-          max_error_rate_percent = float(os.environ["MAX_ERROR_RATE_PERCENT"])
+          if not requests_metrics.ok:
+              fail_request(
+                  "GET",
+                  "/monitoring/requests",
+                  requests_metrics,
+              )
+
+          monitoring_data = requests_metrics.json()
+
+          error_rate_percent = (
+              monitoring_data
+              .get("metrics", {})
+              .get("error_rate_percent", 0.0)
+          )
+
+          # ------------------------------------------------------
+          # Thresholds
+          # ------------------------------------------------------
+          min_disagreements = int(
+              os.environ["MIN_DISAGREEMENTS"]
+          )
+
+          max_error_rate_percent = float(
+              os.environ["MAX_ERROR_RATE_PERCENT"]
+          )
 
           triggered = (
               requires_review_count >= min_disagreements
@@ -186,14 +233,26 @@ jobs:
               "triggered": triggered,
           }
 
-          print(json.dumps(result, indent=2, ensure_ascii=False))
+          print(
+              json.dumps(
+                  result,
+                  indent=2,
+                  ensure_ascii=False,
+              )
+          )
 
           github_output = os.environ["GITHUB_OUTPUT"]
-          with open(github_output, "a", encoding="utf-8") as handle:
+
+          with open(
+              github_output,
+              "a",
+              encoding="utf-8",
+          ) as handle:
               for key, value in result.items():
                   handle.write(f"{key}={value}\n")
-          PYEOF
 
+          PYEOF
+      
       - name: Publier retraining_request.json sur Hugging Face
         if: >
           steps.analysis.outputs.triggered == 'True' &&

@@ -453,17 +453,8 @@ def get_adapter_lm_head_target_size(
         # (ex: "embed_tokens", "wte"). On ne filtre donc plus sur
         # "lm_head" : on cherche n'importe quelle clé
         # "modules_to_save...weight", en excluant les poids LoRA A/B.
-        # CORRECTIF OOM-7bis (2026-07-27) — si lm_head est adapté en
-        # LoRA (target_modules) plutôt qu'en modules_to_save, il n'y a
-        # plus de poids "modules_to_save...weight" complet à lire : la
-        # shape utile se trouve alors sur lora_B (nn.Linear.lora_B,
-        # shape [out_features, r] -> out_features = vocab_size), et non
-        # sur lora_A (shape [r, in_features]). On garde le chemin
-        # modules_to_save en priorité (poids exact, pas de dépendance à
-        # une convention de nommage LoRA), avec repli sur lora_B.
         if filename.endswith(".safetensors"):
             with safe_open(weight_path, framework="pt") as f:
-                lora_b_fallback = None
                 for key in f.keys():
                     if (
                         "modules_to_save" in key
@@ -478,25 +469,8 @@ def get_adapter_lm_head_target_size(
                             shape[0],
                         )
                         return int(shape[0])
-                    if (
-                        "lm_head" in key
-                        and "lora_B" in key
-                        and key.endswith("weight")
-                    ):
-                        lora_b_fallback = (key, f.get_slice(key).get_shape())
-                if lora_b_fallback is not None:
-                    key, shape = lora_b_fallback
-                    logger.info(
-                        "Found lm_head LoRA target shape (lora_B, "
-                        "stratégie bas-rang OOM-7bis) from adapter "
-                        "weights: %s -> vocab_size=%d",
-                        key,
-                        shape[0],
-                    )
-                    return int(shape[0])
         else:
             state_dict = _torch.load(weight_path, map_location="cpu")
-            lora_b_fallback = None
             for key, tensor in state_dict.items():
                 if (
                     "modules_to_save" in key
@@ -510,22 +484,6 @@ def get_adapter_lm_head_target_size(
                         tensor.shape[0],
                     )
                     return int(tensor.shape[0])
-                if (
-                    "lm_head" in key
-                    and "lora_B" in key
-                    and key.endswith("weight")
-                ):
-                    lora_b_fallback = (key, tensor.shape)
-            if lora_b_fallback is not None:
-                key, shape = lora_b_fallback
-                logger.info(
-                    "Found lm_head LoRA target shape (lora_B, stratégie "
-                    "bas-rang OOM-7bis) from adapter weights: %s -> "
-                    "vocab_size=%d",
-                    key,
-                    shape[0],
-                )
-                return int(shape[0])
 
     logger.warning(
         "Could not locate lm_head modules_to_save weight in adapter "
@@ -596,34 +554,17 @@ def check_embed_tokens_trained(
     Ce n'est PAS réparable au merge : les poids embed_tokens n'ont
     jamais été appris nulle part, ce script ne peut que le CONSTATER,
     pas le corriger. Le vrai fix est côté training_model_loader.py /
-    get_peft_model() : soit modules_to_save doit inclure "embed_tokens"
-    en plus de "lm_head" (fine-tuning complet), soit target_modules doit
-    inclure "embed_tokens" (adaptation LoRA bas-rang — possible depuis
-    tie_word_embeddings=False, stratégie recommandée sur GPU contraint,
-    cf. OOM-7bis / sft_config_validation.yaml), suivi d'un
-    ré-entraînement complet SFT -> DPO.
-
-    CORRECTIF OOM-7bis (2026-07-27) — reconnaît désormais DEUX chemins
-    valides pour "embed_tokens entraîné" :
-      1. modules_to_save (historique) : fine-tuning complet, clé
-         "...modules_to_save....weight".
-      2. target_modules LoRA (nouveau, mémoire-efficace) : adaptation
-         bas-rang d'un nn.Embedding, clés "lora_embedding_A"/
-         "lora_embedding_B". Ne pas confondre avec les clés
-         "lora_A"/"lora_B" (nn.Linear, ex. q_proj/lm_head) : PEFT nomme
-         différemment les poids LoRA d'un Embedding.
+    get_peft_model() : modules_to_save doit inclure "embed_tokens" en
+    plus de "lm_head", suivi d'un ré-entraînement complet SFT -> DPO.
 
     Retourne True si embed_tokens semble avoir été sauvegardé/entraîné
-    (clé modules_to_save OU clé lora_embedding_* trouvée), False sinon.
+    (clé modules_to_save correspondante trouvée), False sinon.
     """
     from huggingface_hub import hf_hub_download
     from safetensors import safe_open
     import torch as _torch  # noqa: F401
 
     candidate_filenames = ["adapter_model.safetensors", "adapter_model.bin"]
-
-    def _matches_embed(key: str) -> bool:
-        return "embed_tokens" in key or "wte" in key or "embed_in" in key
 
     for filename in candidate_filenames:
         try:
@@ -641,60 +582,39 @@ def check_embed_tokens_trained(
         else:
             all_keys = list(_torch.load(weight_path, map_location="cpu").keys())
 
-        # Chemin 1 (historique) : modules_to_save — fine-tuning complet
-        modules_to_save_keys = [
+        embed_keys = [
             key
             for key in all_keys
             if "modules_to_save" in key
             and "lora_" not in key
             and key.endswith("weight")
-            and _matches_embed(key)
+            and ("embed_tokens" in key or "wte" in key or "embed_in" in key)
         ]
 
-        # Chemin 2 (nouveau, OOM-7bis) : LoRA bas-rang direct sur
-        # embed_tokens (nn.Embedding -> clés lora_embedding_A/B)
-        lora_embedding_keys = [
-            key
-            for key in all_keys
-            if ("lora_embedding_A" in key or "lora_embedding_B" in key)
-            and _matches_embed(key)
-        ]
-
-        if modules_to_save_keys:
+        if embed_keys:
             logger.info(
                 "OK : poids d'embeddings d'entrée trouvés dans "
                 "modules_to_save (%s) — embed_tokens semble avoir été "
-                "entraîné (fine-tuning complet).",
-                modules_to_save_keys,
-            )
-            return True
-
-        if lora_embedding_keys:
-            logger.info(
-                "OK : poids d'embeddings d'entrée trouvés via adaptation "
-                "LoRA directe (%s) — embed_tokens semble avoir été "
-                "entraîné (stratégie bas-rang, cf. OOM-7bis).",
-                lora_embedding_keys,
+                "entraîné.",
+                embed_keys,
             )
             return True
 
         logger.error(
-            "AUCUNE clé embed_tokens/wte trouvée ni sous modules_to_save "
-            "ni sous lora_embedding_A/B dans %s (clés candidates liées à "
-            "embed_tokens : %s). Cela signifie que la table "
-            "d'embeddings D'ENTRÉE n'a JAMAIS été entraînée pour les "
-            "tokens spéciaux ajoutés (chat template) — SEULE lm_head "
-            "(sortie) l'a été. C'est la cause racine confirmée de la "
-            "génération illisible observée en prod (salade multilingue "
-            "dès les premiers tokens, sur /generate/ ET /triage/). "
-            "Corrige soit modules_to_save=['lm_head', 'embed_tokens'], "
-            "soit target_modules incluant 'embed_tokens' (cf. "
-            "lora_config.py / sft_config_validation.yaml) côté "
+            "AUCUNE clé embed_tokens/wte trouvée sous modules_to_save "
+            "dans %s (clés modules_to_save présentes : %s). Cela "
+            "signifie que la table d'embeddings D'ENTRÉE n'a JAMAIS "
+            "été entraînée pour les tokens spéciaux ajoutés (chat "
+            "template) — SEULE lm_head (sortie) l'a été. C'est la "
+            "cause racine confirmée de la génération illisible "
+            "observée en prod (salade multilingue dès les premiers "
+            "tokens, sur /generate/ ET /triage/). Corrige "
+            "modules_to_save=['lm_head', 'embed_tokens'] côté "
             "training_model_loader.py et RÉENTRAÎNE (SFT puis DPO) "
             "avant de refaire ce merge — ce script ne peut pas "
             "réparer des poids jamais appris.",
             filename,
-            [k for k in all_keys if _matches_embed(k)],
+            [k for k in all_keys if "modules_to_save" in k and "lora_" not in k],
         )
         return False
 

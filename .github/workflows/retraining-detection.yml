@@ -1,0 +1,272 @@
+# ==========================================================
+# medical-triage-agent-ai-poc/.github/workflows/retraining-detection.yml
+# ==========================================================
+#
+# Étape 1 (détection, sans GPU) + Étape 2 (préparation) de la boucle de
+# réentraînement automatique — cf. document de spécification
+# "Mise en place de mécanismes de réentraînement automatique" et les
+# échanges de conception associés.
+#
+# Ce workflow :
+#   1. Obtient un JWT scope="audit" via POST /auth/token (AUDIT_ACCESS_KEY).
+#   2. Interroge GET /audit/clinical (désaccords / requires_human_review)
+#      et GET /monitoring/requests (taux d'erreur global) sur le Space
+#      HF API en production.
+#   3. Compare ces indicateurs à des seuils configurables.
+#   4. Si dépassés, publie backend/app/training/retraining/retraining_request.json
+#      (nouveau, "pending") sur RemDev-AI/medical-triage-agent-ai-poc-models,
+#      lu ensuite par la cellule dédiée du notebook Colab
+#      (training_pipeline_colab.ipynb) avant tout lancement manuel
+#      de train_sft/train_dpo/clinical_eval_runner.
+#
+# IMPORTANT — ORDRE D'EXÉCUTION MANUEL :
+# Ce workflow doit être déclenché AVANT tout déclenchement de
+# deploy-huggingface.yml. En effet, deploy-huggingface.yml appelle
+# HfApi.restart_space() sur le Space API, ce qui réinitialise le
+# journal clinique local (cf. audit_store.py — stockage local au
+# conteneur, non répliqué, effacé à chaque redémarrage du Space).
+# Lancer ce job après un redéploiement produirait une analyse sur un
+# journal clinique tronqué ou vide.
+#
+# AUCUNE modification n'est apportée aux workflows existants
+# (backend-ci.yml, docker-build-push.yml, deploy-huggingface.yml),
+# ni à aucun fichier Python de l'application. Ce fichier est
+# entièrement nouveau et autonome.
+#
+# NOUVEAU SECRET GITHUB REQUIS (à ajouter manuellement, non fourni
+# par ce fichier) :
+#   AUDIT_ACCESS_KEY  — doit correspondre à la valeur configurée côté
+#                       serveur (settings.AUDIT_ACCESS_KEY, cf. auth.py)
+#                       pour obtenir un jeton scope="audit".
+#
+# SECRET RÉUTILISÉ (déjà présent, cf. deploy-huggingface.yml) :
+#   HF_TOKEN_06       — utilisé ici uniquement pour publier
+#                       retraining_request.json sur le repo HF models,
+#                       exactement comme deploy-huggingface.yml
+#                       l'utilise déjà pour restart_space().
+#
+# CORRECTIF APPLIQUÉ (erreur "'env' is already defined, Map keys must
+# be unique") :
+#   Chaque step ne peut avoir qu'UNE seule clé "env:" dans son mapping
+#   YAML. Or 3 steps déclaraient "env:" deux fois (une première fois
+#   pour les secrets/inputs/outputs de steps précédents, une seconde
+#   fois pour ré-injecter une valeur du bloc "env:" global du workflow
+#   sous un nom "_INJECT"). Les deux blocs ont été fusionnés en un
+#   seul "env:" par step. Comportement fonctionnel strictement
+#   identique : toutes les variables (y compris les *_INJECT) sont
+#   simplement regroupées sous une seule clé.
+# ==========================================================
+
+name: Retraining Detection
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_disagreements:
+        description: "Nombre minimal de cas requires_human_review=True pour déclencher une demande"
+        type: number
+        default: 15
+      max_error_rate_percent:
+        description: "Taux d'erreur API (%) à partir duquel une demande est déclenchée"
+        type: number
+        default: 10.0
+      dry_run:
+        description: "Si true, analyse et affiche le résultat sans publier retraining_request.json"
+        type: boolean
+        default: false
+
+concurrency:
+  group: retraining-detection
+  cancel-in-progress: false
+
+env:
+  HF_API_SPACE_URL: https://remdev-ai-medical-triage-agent-ai-poc-api.hf.space
+  HF_MODELS_REPO_ID: RemDev-AI/medical-triage-agent-ai-poc-models
+  RETRAINING_REQUEST_REMOTE_PATH: retraining/retraining_request.json
+
+jobs:
+  detect-and-prepare:
+    name: Analyse clinique & préparation de la demande de réentraînement
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install huggingface_hub requests
+
+      - name: Obtenir un JWT scope="audit"
+        id: auth
+        env:
+          AUDIT_ACCESS_KEY: ${{ secrets.AUDIT_ACCESS_KEY }}
+          HF_API_SPACE_URL_INJECT: ${{ env.HF_API_SPACE_URL }}
+        run: |
+          python - <<'PYEOF'
+          import os
+          import json
+          import sys
+          import requests
+
+          base_url = os.environ["HF_API_SPACE_URL_INJECT"]
+          access_key = os.environ["AUDIT_ACCESS_KEY"]
+
+          response = requests.post(
+              f"{base_url}/auth/token",
+              json={"client_id": "github-actions-retraining-detection", "access_key": access_key},
+              timeout=30,
+          )
+          response.raise_for_status()
+          token = response.json()["access_token"]
+
+          github_output = os.environ["GITHUB_OUTPUT"]
+          with open(github_output, "a", encoding="utf-8") as handle:
+              handle.write(f"token={token}\n")
+          PYEOF
+
+      - name: Analyser le journal clinique et le trafic API
+        id: analysis
+        env:
+          AUDIT_TOKEN: ${{ steps.auth.outputs.token }}
+          MIN_DISAGREEMENTS: ${{ inputs.min_disagreements }}
+          MAX_ERROR_RATE_PERCENT: ${{ inputs.max_error_rate_percent }}
+          HF_API_SPACE_URL_INJECT: ${{ env.HF_API_SPACE_URL }}
+        run: |
+          python - <<'PYEOF'
+          import os
+          import json
+          import requests
+
+          base_url = os.environ["HF_API_SPACE_URL_INJECT"]
+          token = os.environ["AUDIT_TOKEN"]
+          headers = {"Authorization": f"Bearer {token}"}
+
+          # GET /audit/clinical — désaccords / requires_human_review
+          # (limit=1000 : plafond max accepté par l'endpoint, cf. audit.py)
+          clinical = requests.get(
+              f"{base_url}/audit/clinical",
+              headers=headers,
+              params={"limit": 1000},
+              timeout=30,
+          )
+          clinical.raise_for_status()
+          clinical_data = clinical.json()
+
+          logs = clinical_data.get("logs", [])
+          total_analyzed = len(logs)
+          requires_review_count = sum(
+              1 for entry in logs if entry.get("requires_human_review") is True
+          )
+
+          # GET /monitoring/requests — taux d'erreur global (pas de scope requis)
+          requests_metrics = requests.get(
+              f"{base_url}/monitoring/requests",
+              timeout=30,
+          )
+          requests_metrics.raise_for_status()
+          error_rate_percent = (
+              requests_metrics.json().get("metrics", {}).get("error_rate_percent", 0.0)
+          )
+
+          min_disagreements = int(os.environ["MIN_DISAGREEMENTS"])
+          max_error_rate_percent = float(os.environ["MAX_ERROR_RATE_PERCENT"])
+
+          triggered = (
+              requires_review_count >= min_disagreements
+              or error_rate_percent >= max_error_rate_percent
+          )
+
+          result = {
+              "total_clinical_entries_analyzed": total_analyzed,
+              "requires_human_review_count": requires_review_count,
+              "error_rate_percent": error_rate_percent,
+              "triggered": triggered,
+          }
+
+          print(json.dumps(result, indent=2, ensure_ascii=False))
+
+          github_output = os.environ["GITHUB_OUTPUT"]
+          with open(github_output, "a", encoding="utf-8") as handle:
+              for key, value in result.items():
+                  handle.write(f"{key}={value}\n")
+          PYEOF
+
+      - name: Publier retraining_request.json sur Hugging Face
+        if: >
+          steps.analysis.outputs.triggered == 'True' &&
+          inputs.dry_run != true
+        env:
+          HF_TOKEN_06: ${{ secrets.HF_TOKEN_06 }}
+          TOTAL_ANALYZED: ${{ steps.analysis.outputs.total_clinical_entries_analyzed }}
+          REVIEW_COUNT: ${{ steps.analysis.outputs.requires_human_review_count }}
+          ERROR_RATE: ${{ steps.analysis.outputs.error_rate_percent }}
+          MIN_DISAGREEMENTS: ${{ inputs.min_disagreements }}
+          MAX_ERROR_RATE_PERCENT: ${{ inputs.max_error_rate_percent }}
+          HF_MODELS_REPO_ID_INJECT: ${{ env.HF_MODELS_REPO_ID }}
+          RETRAINING_REQUEST_REMOTE_PATH_INJECT: ${{ env.RETRAINING_REQUEST_REMOTE_PATH }}
+        run: |
+          python - <<'PYEOF'
+          import os
+          import json
+          import tempfile
+          from datetime import datetime, timezone
+          from huggingface_hub import HfApi
+
+          hf_repo_id = os.environ["HF_MODELS_REPO_ID_INJECT"]
+          remote_path = os.environ["RETRAINING_REQUEST_REMOTE_PATH_INJECT"]
+
+          payload = {
+              "status": "pending",
+              "created_at": datetime.now(timezone.utc).isoformat(),
+              "requested_by": "github-actions:retraining-detection",
+              "run_id": os.environ.get("GITHUB_RUN_ID", "unknown"),
+              "reason": {
+                  "total_clinical_entries_analyzed": int(os.environ["TOTAL_ANALYZED"]),
+                  "requires_human_review_count": int(os.environ["REVIEW_COUNT"]),
+                  "error_rate_percent": float(os.environ["ERROR_RATE"]),
+              },
+              "thresholds": {
+                  "min_disagreements": int(os.environ["MIN_DISAGREEMENTS"]),
+                  "max_error_rate_percent": float(os.environ["MAX_ERROR_RATE_PERCENT"]),
+              },
+              "notebook": {
+                  "consumed_at": None,
+                  "consumed_by": None,
+              },
+          }
+
+          with tempfile.NamedTemporaryFile(
+              mode="w", suffix=".json", delete=False, encoding="utf-8"
+          ) as tmp:
+              json.dump(payload, tmp, indent=2, ensure_ascii=False)
+              tmp_path = tmp.name
+
+          api = HfApi(token=os.environ["HF_TOKEN_06"])
+          api.upload_file(
+              path_or_fileobj=tmp_path,
+              path_in_repo=remote_path,
+              repo_id=hf_repo_id,
+              repo_type="model",
+              commit_message=(
+                  "Retraining request created by GitHub Actions "
+                  f"(run {os.environ.get('GITHUB_RUN_ID', 'unknown')})"
+              ),
+          )
+
+          print(f"retraining_request.json publié sur {hf_repo_id}/{remote_path}")
+          print(json.dumps(payload, indent=2, ensure_ascii=False))
+          PYEOF
+
+      - name: Résumé
+        run: |
+          echo "### Résultat de la détection" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Entrées cliniques analysées : ${{ steps.analysis.outputs.total_clinical_entries_analyzed }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Cas requires_human_review : ${{ steps.analysis.outputs.requires_human_review_count }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Taux d'erreur API : ${{ steps.analysis.outputs.error_rate_percent }}%" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Réentraînement déclenché : ${{ steps.analysis.outputs.triggered }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "- Mode dry_run activé : aucune publication effectuée." >> "$GITHUB_STEP_SUMMARY"
+          fi

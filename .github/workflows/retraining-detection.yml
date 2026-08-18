@@ -1,7 +1,7 @@
 # ==========================================================
 # medical-triage-agent-ai-poc/.github/workflows/retraining-detection.yml
 # ==========================================================
-#
+
 # Étape 1 (détection, sans GPU) + Étape 2 (préparation) de la boucle de
 # réentraînement automatique — cf. document de spécification
 # "Mise en place de mécanismes de réentraînement automatique" et les
@@ -19,19 +19,26 @@
 #      (training_pipeline_colab.ipynb) avant tout lancement manuel
 #      de train_sft/train_dpo/clinical_eval_runner.
 #
-# IMPORTANT — ORDRE D'EXÉCUTION MANUEL :
-# Ce workflow doit être déclenché AVANT tout déclenchement de
-# deploy-huggingface.yml. En effet, deploy-huggingface.yml appelle
-# HfApi.restart_space() sur le Space API, ce qui réinitialise le
-# journal clinique local (cf. audit_store.py — stockage local au
-# conteneur, non répliqué, effacé à chaque redémarrage du Space).
-# Lancer ce job après un redéploiement produirait une analyse sur un
-# journal clinique tronqué ou vide.
+# ORDRE D'EXÉCUTION — DÉSORMAIS AUTOMATISÉ :
+# Ce workflow se déclenche automatiquement à la fin (succès) de
+# "Docker Build & Push" sur main, c'est-à-dire AVANT
+# deploy-huggingface.yml (qui, lui, se déclenche désormais à la fin
+# de CE workflow — cf. "on: workflow_run" dans deploy-huggingface.yml).
+# Cela garantit que l'analyse clinique s'exécute toujours sur le
+# journal du Space encore actif, avant que
+# HfApi.restart_space() (déclenché par deploy-huggingface.yml) ne
+# réinitialise le journal clinique local (cf. audit_store.py —
+# stockage local au conteneur, non répliqué, effacé à chaque
+# redémarrage du Space).
 #
-# AUCUNE modification n'est apportée aux workflows existants
-# (backend-ci.yml, docker-build-push.yml, deploy-huggingface.yml),
-# ni à aucun fichier Python de l'application. Ce fichier est
-# entièrement nouveau et autonome.
+# Le déclenchement manuel (workflow_dispatch) reste disponible pour
+# les analyses ponctuelles / dry-run, indépendamment de la chaîne
+# automatique.
+#
+# AUCUNE modification n'est apportée aux workflows existants autres
+# que deploy-huggingface.yml (changement de son déclencheur
+# workflow_run, cf. ce fichier), ni à aucun fichier Python de
+# l'application.
 #
 # NOUVEAU SECRET GITHUB REQUIS (à ajouter manuellement, non fourni
 # par ce fichier) :
@@ -44,22 +51,15 @@
 #                       retraining_request.json sur le repo HF models,
 #                       exactement comme deploy-huggingface.yml
 #                       l'utilise déjà pour restart_space().
-#
-# CORRECTIF APPLIQUÉ (erreur "'env' is already defined, Map keys must
-# be unique") :
-#   Chaque step ne peut avoir qu'UNE seule clé "env:" dans son mapping
-#   YAML. Or 3 steps déclaraient "env:" deux fois (une première fois
-#   pour les secrets/inputs/outputs de steps précédents, une seconde
-#   fois pour ré-injecter une valeur du bloc "env:" global du workflow
-#   sous un nom "_INJECT"). Les deux blocs ont été fusionnés en un
-#   seul "env:" par step. Comportement fonctionnel strictement
-#   identique : toutes les variables (y compris les *_INJECT) sont
-#   simplement regroupées sous une seule clé.
 # ==========================================================
 
 name: Retraining Detection
 
 on:
+  workflow_run:
+    workflows: ["Docker Build & Push"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       min_disagreements:
@@ -83,11 +83,24 @@ env:
   HF_API_SPACE_URL: https://remdev-ai-medical-triage-agent-ai-poc-api.hf.space
   HF_MODELS_REPO_ID: RemDev-AI/medical-triage-agent-ai-poc-models
   RETRAINING_REQUEST_REMOTE_PATH: retraining/retraining_request.json
+  # Valeurs par défaut utilisées lorsque le workflow est déclenché
+  # automatiquement par "Docker Build & Push" (workflow_run), cas où
+  # le contexte "inputs" n'existe pas.
+  DEFAULT_MIN_DISAGREEMENTS: 15
+  DEFAULT_MAX_ERROR_RATE_PERCENT: 10.0
 
 jobs:
   detect-and-prepare:
     name: Analyse clinique & préparation de la demande de réentraînement
     runs-on: ubuntu-latest
+    # Ne s'exécute que si :
+    #  - déclenchement manuel (workflow_dispatch), ou
+    #  - déclenchement automatique après un "Docker Build & Push" réussi sur main.
+    # Un build en échec ne doit pas déclencher d'analyse (le Space n'a
+    # de toute façon pas vocation à être redéployé ensuite).
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     steps:
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -131,8 +144,11 @@ jobs:
         id: analysis
         env:
           AUDIT_TOKEN: ${{ steps.auth.outputs.token }}
-          MIN_DISAGREEMENTS: ${{ inputs.min_disagreements }}
-          MAX_ERROR_RATE_PERCENT: ${{ inputs.max_error_rate_percent }}
+          # inputs.* n'existe pas lorsque le workflow est déclenché
+          # automatiquement (workflow_run) : on retombe alors sur les
+          # valeurs par défaut définies dans le bloc "env:" global.
+          MIN_DISAGREEMENTS: ${{ inputs.min_disagreements || env.DEFAULT_MIN_DISAGREEMENTS }}
+          MAX_ERROR_RATE_PERCENT: ${{ inputs.max_error_rate_percent || env.DEFAULT_MAX_ERROR_RATE_PERCENT }}
           HF_API_SPACE_URL_INJECT: ${{ env.HF_API_SPACE_URL }}
         run: |
           python - <<'PYEOF'
@@ -262,8 +278,8 @@ jobs:
           TOTAL_ANALYZED: ${{ steps.analysis.outputs.total_clinical_entries_analyzed }}
           REVIEW_COUNT: ${{ steps.analysis.outputs.requires_human_review_count }}
           ERROR_RATE: ${{ steps.analysis.outputs.error_rate_percent }}
-          MIN_DISAGREEMENTS: ${{ inputs.min_disagreements }}
-          MAX_ERROR_RATE_PERCENT: ${{ inputs.max_error_rate_percent }}
+          MIN_DISAGREEMENTS: ${{ inputs.min_disagreements || env.DEFAULT_MIN_DISAGREEMENTS }}
+          MAX_ERROR_RATE_PERCENT: ${{ inputs.max_error_rate_percent || env.DEFAULT_MAX_ERROR_RATE_PERCENT }}
           HF_MODELS_REPO_ID_INJECT: ${{ env.HF_MODELS_REPO_ID }}
           RETRAINING_REQUEST_REMOTE_PATH_INJECT: ${{ env.RETRAINING_REQUEST_REMOTE_PATH }}
         run: |
@@ -322,6 +338,7 @@ jobs:
       - name: Résumé
         run: |
           echo "### Résultat de la détection" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Déclenchement : ${{ github.event_name }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Entrées cliniques analysées : ${{ steps.analysis.outputs.total_clinical_entries_analyzed }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Cas requires_human_review : ${{ steps.analysis.outputs.requires_human_review_count }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Taux d'erreur API : ${{ steps.analysis.outputs.error_rate_percent }}%" >> "$GITHUB_STEP_SUMMARY"
@@ -329,3 +346,4 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             echo "- Mode dry_run activé : aucune publication effectuée." >> "$GITHUB_STEP_SUMMARY"
           fi
+          echo "- Suite de la chaîne : deploy-huggingface.yml se déclenchera automatiquement à la fin de ce workflow." >> "$GITHUB_STEP_SUMMARY"

@@ -5,8 +5,17 @@
 name: Deploy to Hugging Face Spaces
 
 on:
+  # Chaînage automatique : Docker Build & Push -> Retraining Detection
+  # -> Deploy to Hugging Face Spaces (ce workflow).
+  # On se déclenche désormais à la fin de "Retraining Detection" (et
+  # non plus directement à la fin de "Docker Build & Push") afin que
+  # l'analyse clinique s'exécute toujours AVANT le restart_space()
+  # ci-dessous, qui réinitialise le journal clinique local du Space
+  # (cf. retraining-detection.yml pour le détail de cette contrainte).
+  # "Retraining Detection" se déclenche lui-même automatiquement à la
+  # fin de "Docker Build & Push", donc la chaîne reste intacte.
   workflow_run:
-    workflows: ["Docker Build & Push"]
+    workflows: ["Retraining Detection"]
     types: [completed]
     branches: [main]
   workflow_dispatch:
@@ -45,6 +54,7 @@ jobs:
           echo "Checklist go/no-go :"
           echo "  [x] Tests unitaires/integration/sécurité verts (backend-ci)"
           echo "  [x] Images Docker construites et scannées (Trivy)"
+          echo "  [x] Analyse de dérive clinique effectuée (retraining-detection)"
           echo "  [ ] Validation manuelle requise pour la production"
           echo "proceed=true" >> "$GITHUB_OUTPUT"
   
@@ -77,7 +87,7 @@ jobs:
             --exclude 'app/datasets/raw' \
             backend/ /tmp/hf-api-space/
           cp backend/Dockerfile /tmp/hf-api-space/Dockerfile
-          cp backend/README_backend.md /tmp/hf-api-space/README_backend.md
+          cp backend/README_backend.md /tmp/hf-api-space/README.md
 
       - name: Push to Hugging Face Space (API) via Git
         env:
@@ -103,6 +113,7 @@ jobs:
         env:
           HF_TOKEN_06: ${{ secrets.HF_TOKEN_06 }}
         run: |
+          pip install --quiet huggingface_hub
           python - <<'PYEOF'
           import os
           from huggingface_hub import HfApi
@@ -158,7 +169,7 @@ jobs:
             --exclude '*.pyc' \
             frontend/ /tmp/hf-ui-space/
           cp frontend/Dockerfile.hf /tmp/hf-ui-space/Dockerfile
-          cp frontend/README_frontend.md /tmp/hf-ui-space/README_frontend.md
+          cp frontend/README_frontend.md /tmp/hf-ui-space/README.md
 
       - name: Push to Hugging Face Space (UI) via Git
         env:
@@ -184,6 +195,7 @@ jobs:
         env:
           HF_TOKEN_06: ${{ secrets.HF_TOKEN_06 }}
         run: |
+          pip install --quiet huggingface_hub
           python - <<'PYEOF'
           import os
           from huggingface_hub import HfApi

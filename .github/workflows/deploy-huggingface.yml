@@ -66,7 +66,7 @@ jobs:
       needs.gate-check.outputs.proceed == 'true' &&
       (github.event.inputs.target == 'both' || github.event.inputs.target == 'api' || github.event.inputs.target == '')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -150,7 +150,7 @@ jobs:
       needs.gate-check.outputs.proceed == 'true' &&
       (github.event.inputs.target == 'both' || github.event.inputs.target == 'ui' || github.event.inputs.target == '')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 

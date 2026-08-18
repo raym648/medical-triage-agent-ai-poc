@@ -28,7 +28,7 @@ jobs:
         # Le rapport reste visible dans les logs de l'action.
         # À retirer si ce garde-fou doit redevenir bloquant plus tard.
         continue-on-error: true
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@v3
         env:
             GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

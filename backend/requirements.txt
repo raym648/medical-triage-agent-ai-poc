@@ -79,7 +79,7 @@ uvicorn[standard]
 
 # vllm==0.17.0
 #
-# IMPORTANT : on n'utilise PAS "vllm==0.25.1+cpu" tel quel ici,
+# IMPORTANT : on n'utilise PAS "vllm==0.26.0" tel quel ici,
 # car pip a besoin d'un index qui expose EXACTEMENT cette chaîne
 # de version, et rien ne garantit qu'il ne préfère pas silencieusement
 # une variante "vanilla" trouvée sur PyPI. On épingle donc l'URL
@@ -101,12 +101,12 @@ https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1+cpu-c
 # ci-dessus force généralement une version de torch compatible via
 # ses propres dépendances, mais pour lever toute ambiguïté :
 # ATTENTION : version alignée sur l'exigence exacte de
-# vllm==0.25.1+cpu (confirmée par le message d'erreur pip
-# "vllm 0.25.1+cpu depends on torch==2.11.0+cpu" obtenu lors
+# vllm==0.26.0 (confirmée par le message d'erreur pip
+# "vllm 0.25.1+cpu depends on torch==2.12.1+cpu" obtenu lors
 # d'un précédent build en échec — ne pas repin une autre
 # version sans revérifier ce message si vous changez de
 # version de vllm.
-torch==2.11.0+cpu
+torch==2.12.1+cpu
 transformers
 sentencepiece
 safetensors
@@ -179,7 +179,7 @@ passlib[bcrypt]
 # ==========================================================
 
 # IMPORTANT : setuptools est ici épinglé sur EXACTEMENT ce
-# qu'exige vllm==0.25.1+cpu dans son arbre de dépendances
+# qu'exige vllm==0.26.0 dans son arbre de dépendances
 # (pip a rejeté toute autre version avec "ResolutionImpossible" :
 # "vllm 0.25.1+cpu depends on setuptools==77.0.3"). Le pin
 # précédent (>=78.1.1, motivé par une CVE côté setuptools)
